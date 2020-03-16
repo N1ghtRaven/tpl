@@ -29,39 +29,11 @@ static const char id[]="$Id: tpl.c 192 2009-04-24 10:35:30Z thanson $";
 #include <stdlib.h>  /* malloc */
 #include <stdarg.h>  /* va_list */
 #include <string.h>  /* memcpy, memset, strchr */
-#include <stdio.h>   /* printf (tpl_hook.oops default function) */
 
-#ifndef _WIN32
 #include <unistd.h>     /* for ftruncate */
-#else
-#include <io.h>
-#define ftruncate(x,y) _chsize(x,y)
-#endif
-#include <sys/types.h>  /* for 'open' */
-#include <sys/stat.h>   /* for 'open' */
-#include <fcntl.h>      /* for 'open' */
+
 #include <errno.h>
-#ifndef _WIN32
 #include <inttypes.h>   /* uint32_t, uint64_t, etc */
-#else
-typedef unsigned short ushort;
-typedef __int16 int16_t;
-typedef __int32 int32_t;
-typedef __int64 int64_t;
-typedef unsigned __int16 uint16_t;
-typedef unsigned __int32 uint32_t;
-typedef unsigned __int64 uint64_t;
-#endif
-
-#ifndef S_ISREG
-#define S_ISREG(mode)  (((mode) & S_IFMT) == S_IFREG)
-#endif
-
-#if ( defined __CYGWIN__ || defined __MINGW32__ || defined _WIN32 )
-#include "win/mman.h"   /* mmap */
-#else
-#include <sys/mman.h>   /* mmap */
-#endif
 
 #include "tpl.h"
 
@@ -183,8 +155,6 @@ static void *tpl_dump_atyp(tpl_node *n, tpl_atyp* at, void *dv);
 static size_t tpl_ser_osz(tpl_node *n);
 static void tpl_free_atyp(tpl_node *n,tpl_atyp *atyp);
 static int tpl_dump_to_mem(tpl_node *r, void *addr, size_t sz);
-static int tpl_mmap_file(char *filename, tpl_mmap_rec *map_rec);
-static int tpl_mmap_output_file(char *filename, size_t sz, void **text_out);
 static int tpl_cpu_bigendian(void);
 static int tpl_needs_endian_swap(void *);
 static void tpl_byteswap(void *word, int len);
@@ -253,7 +223,7 @@ static const struct tpl_type_t tpl_types[] = {
 static int tpl_oops(const char *fmt, ...) {
     va_list ap;
     va_start(ap,fmt);
-    vfprintf(stderr,fmt,ap);
+    //FIXME: vfprintf(,fmt,ap);
     va_end(ap);
     return 0;
 }
@@ -261,7 +231,7 @@ static int tpl_oops(const char *fmt, ...) {
 
 static tpl_node *tpl_node_new(tpl_node *parent) {
     tpl_node *n;
-    if ((n=tpl_hook.malloc(sizeof(tpl_node))) == NULL) {
+    if ((n = (tpl_node*) tpl_hook.malloc(sizeof(tpl_node))) == NULL) {
         fatal_oom();
     }
     n->addr=NULL;
@@ -427,7 +397,7 @@ TPL_API tpl_node *tpl_map_va(char *fmt, va_list ap) {
                   if (pound_num < 1) {
                     tpl_hook.fatal("non-positive iteration count %d\n", pound_num);
                   }
-                  if (num_contig_fxlens >= (sizeof(contig_fxlens)/sizeof(contig_fxlens[0]))) {
+                  if ((uint64_t) num_contig_fxlens >= (sizeof(contig_fxlens)/sizeof(contig_fxlens[0]))) {
                     tpl_hook.fatal("contiguous # exceeds hardcoded limit\n");
                   }
                   contig_fxlens[num_contig_fxlens++] = pound_num;
@@ -475,7 +445,7 @@ TPL_API tpl_node *tpl_map_va(char *fmt, va_list ap) {
                 (((tpl_root_data*)root->data)->num_fxlens) += num_contig_fxlens;
                 num_fxlens = ((tpl_root_data*)root->data)->num_fxlens; /* new value */
                 fxlens = ((tpl_root_data*)root->data)->fxlens;
-                fxlens = tpl_hook.realloc(fxlens, sizeof(int) * num_fxlens);
+                fxlens = (int*) tpl_hook.realloc(fxlens, sizeof(int) * num_fxlens);
                 if (!fxlens) fatal_oom();
                 ((tpl_root_data*)root->data)->fxlens = fxlens;
                 for(i=0; i < num_contig_fxlens; i++) fxlens[j++] = contig_fxlens[i];
@@ -557,7 +527,7 @@ TPL_API tpl_node *tpl_map_va(char *fmt, va_list ap) {
     if (lparen_level != 0) goto fail;
 
     /* copy the format string, save for convenience */
-    ((tpl_root_data*)(root->data))->fmt = tpl_hook.malloc(strlen(fmt)+1);
+    ((tpl_root_data*)(root->data))->fmt = (char*) tpl_hook.malloc(strlen(fmt)+1);
     if (((tpl_root_data*)(root->data))->fmt == NULL) 
         fatal_oom();
     memcpy(((tpl_root_data*)(root->data))->fmt,fmt,strlen(fmt)+1);
@@ -570,28 +540,14 @@ fail:
     return NULL;
 }
 
-static int tpl_unmap_file( tpl_mmap_rec *mr) {
-
-    if ( munmap( mr->text, mr->text_sz ) == -1 ) {
-        tpl_hook.oops("Failed to munmap: %s\n", strerror(errno));
-    }
-    close(mr->fd);
-    mr->text = NULL;
-    mr->text_sz = 0;
-    return 0;
-}
-
 static void tpl_free_keep_map(tpl_node *r) {
-    int mmap_bits = (TPL_RDONLY|TPL_FILE);
     int ufree_bits = (TPL_MEM|TPL_UFREE);
     tpl_node *nxtc,*c;
     int find_next_node=0,looking,i;
     size_t sz;
 
     /* For mmap'd files, or for 'ufree' memory images , do appropriate release */
-    if ((((tpl_root_data*)(r->data))->flags & mmap_bits) == mmap_bits) {
-        tpl_unmap_file( &((tpl_root_data*)(r->data))->mmap); 
-    } else if ((((tpl_root_data*)(r->data))->flags & ufree_bits) == ufree_bits) {
+    if ((((tpl_root_data*)(r->data))->flags & ufree_bits) == ufree_bits) {
         tpl_hook.free( ((tpl_root_data*)(r->data))->mmap.text );
     }
 
@@ -635,7 +591,7 @@ static void tpl_free_keep_map(tpl_node *r) {
                     c->ser_osz = 0; /* zero out the serialization output size */
 
                     sz = ((tpl_atyp*)(c->data))->sz;  /* save sz to use below */
-                    tpl_free_atyp(c,c->data);
+                    tpl_free_atyp(c, (tpl_atyp*) c->data);
 
                     /* make new atyp */
                     c->data = (tpl_atyp*)tpl_hook.malloc(sizeof(tpl_atyp));
@@ -677,16 +633,13 @@ static void tpl_free_keep_map(tpl_node *r) {
 }
 
 TPL_API void tpl_free(tpl_node *r) {
-    int mmap_bits = (TPL_RDONLY|TPL_FILE);
     int ufree_bits = (TPL_MEM|TPL_UFREE);
     tpl_node *nxtc,*c;
     int find_next_node=0,looking,num,i;
     tpl_pidx *pidx,*pidx_nxt;
 
     /* For mmap'd files, or for 'ufree' memory images , do appropriate release */
-    if ((((tpl_root_data*)(r->data))->flags & mmap_bits) == mmap_bits) {
-        tpl_unmap_file( &((tpl_root_data*)(r->data))->mmap); 
-    } else if ((((tpl_root_data*)(r->data))->flags & ufree_bits) == ufree_bits) {
+    if ((((tpl_root_data*)(r->data))->flags & ufree_bits) == ufree_bits) {
         tpl_hook.free( ((tpl_root_data*)(r->data))->mmap.text );
     }
 
@@ -738,7 +691,7 @@ TPL_API void tpl_free(tpl_node *r) {
                     find_next_node=1;
                     break;
                 case TPL_TYPE_ARY:
-                    tpl_free_atyp(c,c->data);
+                    tpl_free_atyp(c,(tpl_atyp*) c->data);
                     if (c->children) c = c->children; /* normal case */
                     else find_next_node=1; /* edge case, handle bad format A() */
                     break;
@@ -988,11 +941,10 @@ static size_t tpl_ser_osz(tpl_node *n) {
 
 TPL_API int tpl_dump(tpl_node *r, int mode, ...) {
     va_list ap;
-    char *filename, *bufv;
     void **addr_out,*buf, *pa_addr;
-    int fd,rc=0;
+    int rc=0;
     size_t sz,*sz_out, pa_sz;
-    struct stat sbuf;
+    //struct stat sbuf;
 
     if (((tpl_root_data*)(r->data))->flags & TPL_RDONLY) {  /* unusual */
         tpl_hook.oops("error: tpl_dump called for a loaded tpl\n");
@@ -1002,46 +954,7 @@ TPL_API int tpl_dump(tpl_node *r, int mode, ...) {
     sz = tpl_ser_osz(r); /* compute the size needed to serialize  */
 
     va_start(ap,mode);
-    if (mode & TPL_FILE) {
-        filename = va_arg(ap,char*);
-        fd = tpl_mmap_output_file(filename, sz, &buf);
-        if (fd == -1) rc = -1;
-        else {
-            rc = tpl_dump_to_mem(r,buf,sz);
-            if (msync(buf,sz,MS_SYNC) == -1) {
-                tpl_hook.oops("msync failed on fd %d: %s\n", fd, strerror(errno));
-            }
-            if (munmap(buf, sz) == -1) {
-                tpl_hook.oops("munmap failed on fd %d: %s\n", fd, strerror(errno));
-            }
-            close(fd);
-        }
-    } else if (mode & TPL_FD) {
-        fd = va_arg(ap, int);
-        if ( (buf = tpl_hook.malloc(sz)) == NULL) fatal_oom();
-        tpl_dump_to_mem(r,buf,sz);
-        bufv = buf;
-        do {
-            rc = write(fd,bufv,sz);
-            if (rc > 0) {
-                sz -= rc;
-                bufv += rc;
-            } else if (rc == -1) {
-                if (errno == EINTR || errno == EAGAIN) continue;
-                tpl_hook.oops("error writing to fd %d: %s\n", fd, strerror(errno));
-                /* attempt to rewind partial write to a regular file */
-                if (fstat(fd,&sbuf) == 0 && S_ISREG(sbuf.st_mode)) {
-                  if (ftruncate(fd,sbuf.st_size - (bufv-(char*)buf)) == -1) {
-                    tpl_hook.oops("can't rewind: %s\n", strerror(errno));
-                  }
-                }
-                free(buf);
-                return -1;
-            }
-        } while (sz > 0);
-        free(buf);
-        rc = 0;
-    } else if (mode & TPL_MEM) {
+    if (mode & TPL_MEM) {
         if (mode & TPL_PREALLOCD) { /* caller allocated */
           pa_addr = (void*)va_arg(ap, void*);
           pa_sz = va_arg(ap, size_t);
@@ -1268,9 +1181,9 @@ static int tpl_needs_endian_swap(void *d) {
 }
 
 static size_t tpl_size_for(char c) {
-  int i;
-  for(i=0; i < sizeof(tpl_types)/sizeof(tpl_types[0]); i++) {
-    if (tpl_types[i].c == c) return tpl_types[i].sz;
+  for(uint64_t i =0; i < sizeof(tpl_types)/sizeof(tpl_types[0]); i++) {
+    if (tpl_types[i].c == c) 
+        return tpl_types[i].sz;
   }
   return 0;
 }
@@ -1278,11 +1191,10 @@ static size_t tpl_size_for(char c) {
 TPL_API char* tpl_peek(int mode, ...) {
     va_list ap;
     int xendian=0,found_nul=0,old_string_format=0;
-    char *filename=NULL, *datapeek_f=NULL, *datapeek_c, *datapeek_s;
+    char *datapeek_f=NULL, *datapeek_c, *datapeek_s;
     void *addr=NULL, *dv, *datapeek_p=NULL;
     size_t sz=0, fmt_len, first_atom, num_fxlens=0;
     uint32_t datapeek_ssz, datapeek_csz, datapeek_flen;
-    tpl_mmap_rec mr = {0,NULL,0};
     char *fmt,*fmt_cpy=NULL,c;
     uint32_t intlsz, **fxlens=NULL, *num_fxlens_out=NULL, *fxlensv;
 
@@ -1291,8 +1203,7 @@ TPL_API char* tpl_peek(int mode, ...) {
         tpl_hook.oops("TPL_FXLENS and TPL_DATAPEEK mutually exclusive\n");
         goto fail;
     }
-    if (mode & TPL_FILE) filename = va_arg(ap,char *);
-    else if (mode & TPL_MEM) {
+    if (mode & TPL_MEM) {
         addr = va_arg(ap,void *);
         sz = va_arg(ap,size_t);
     } else {
@@ -1307,15 +1218,6 @@ TPL_API char* tpl_peek(int mode, ...) {
         fxlens = va_arg(ap,uint32_t **);
         *num_fxlens_out = 0;
         *fxlens = NULL;
-    }
-
-    if (mode & TPL_FILE) {
-        if (tpl_mmap_file(filename, &mr) != 0) {
-            tpl_hook.oops("tpl_peek failed for file %s\n", filename);
-            goto fail;
-        }
-        addr = mr.text;
-        sz = mr.text_sz;
     }
 
     dv = addr;
@@ -1341,7 +1243,7 @@ TPL_API char* tpl_peek(int mode, ...) {
     }
     if (!found_nul) goto fail;  /* runaway format string */
     fmt_len = (char*)dv - fmt;  /* include space for \0 */
-    fmt_cpy = tpl_hook.malloc(fmt_len);
+    fmt_cpy = (char*) tpl_hook.malloc(fmt_len);
     if (fmt_cpy == NULL) {
         fatal_oom();
     }
@@ -1354,7 +1256,7 @@ TPL_API char* tpl_peek(int mode, ...) {
       }
     }
     if ((mode & TPL_FXLENS) && (num_fxlens > 0)) {
-      *fxlens = tpl_hook.malloc(num_fxlens * sizeof(uint32_t));
+      *fxlens = (uint32_t*) tpl_hook.malloc(num_fxlens * sizeof(uint32_t));
       if (*fxlens == NULL) tpl_hook.fatal("out of memory");
       *num_fxlens_out = num_fxlens;
       fxlensv = *fxlens;
@@ -1404,7 +1306,7 @@ TPL_API char* tpl_peek(int mode, ...) {
                tpl_hook.free(fmt_cpy); fmt_cpy = NULL; /* fail */
                goto fail;
              }
-             datapeek_s = tpl_hook.malloc(datapeek_ssz);
+             datapeek_s = (char*) tpl_hook.malloc(datapeek_ssz);
              if (datapeek_s == NULL) fatal_oom();
              memcpy(datapeek_s, dv, datapeek_ssz-1);
              datapeek_s[datapeek_ssz-1] = '\0';
@@ -1427,7 +1329,6 @@ TPL_API char* tpl_peek(int mode, ...) {
 
 fail:
     va_end(ap);
-    if ((mode & TPL_FILE) && mr.text != NULL) tpl_unmap_file( &mr );
     return fmt_cpy;
 }
 
@@ -1436,37 +1337,21 @@ fail:
 /* tpl_jot(TPL_FD, fd, "si", &s, &i); */
 TPL_API int tpl_jot(int mode, ...) {
     va_list ap;
-    char *filename, *fmt;
+    char *fmt;
     size_t *sz;
-    int fd, rc=0;
+    int rc=0;
     void **buf;
     tpl_node *tn;
 
     va_start(ap,mode);
-    if (mode & TPL_FILE) {
-      filename = va_arg(ap,char*);
-      fmt = va_arg(ap,char*);
-      tn = tpl_map_va(fmt, ap);
-      if (tn == NULL) { rc=-1; goto fail;}
-      tpl_pack(tn, 0);
-      rc = tpl_dump(tn, TPL_FILE, filename);
-      tpl_free(tn);
-    } else if (mode & TPL_MEM) {
-      buf = va_arg(ap,void*);
+    if (mode & TPL_MEM) {
+      buf = va_arg(ap,void**);
       sz = va_arg(ap,size_t*);
       fmt = va_arg(ap,char*);
       tn = tpl_map_va(fmt,ap);
       if (tn == NULL) { rc=-1; goto fail;}
       tpl_pack(tn,0);
       rc = tpl_dump(tn, TPL_MEM, buf, sz);
-      tpl_free(tn);
-    } else if (mode & TPL_FD) {
-      fd = va_arg(ap,int);
-      fmt = va_arg(ap,char*);
-      tn = tpl_map_va(fmt,ap);
-      if (tn == NULL) { rc=-1; goto fail;}
-      tpl_pack(tn,0);
-      rc = tpl_dump(tn, TPL_FD, fd);
       tpl_free(tn);
     } else {
       tpl_hook.fatal("invalid tpl_jot mode\n");
@@ -1480,17 +1365,13 @@ fail:
 TPL_API int tpl_load(tpl_node *r, int mode, ...) {
     va_list ap;
     int rc=0,fd=0;
-    char *filename=NULL;
     void *addr;
     size_t sz;
 
     va_start(ap,mode);
-    if (mode & TPL_FILE) filename = va_arg(ap,char *);
-    else if (mode & TPL_MEM) {
+    if (mode & TPL_MEM) {
         addr = va_arg(ap,void *);
         sz = va_arg(ap,size_t);
-    } else if (mode & TPL_FD) {
-        fd = va_arg(ap,int);
     } else {
         tpl_hook.oops("unsupported tpl_load mode %d\n", mode);
         return -1;
@@ -1505,24 +1386,7 @@ TPL_API int tpl_load(tpl_node *r, int mode, ...) {
         /* already packed or loaded, so reset it as if newly mapped */
         tpl_free_keep_map(r);
     }
-    if (mode & TPL_FILE) {
-        if (tpl_mmap_file(filename, &((tpl_root_data*)(r->data))->mmap) != 0) {
-            tpl_hook.oops("tpl_load failed for file %s\n", filename);
-            return -1;
-        }
-        if ( (rc = tpl_sanity(r, (mode & TPL_EXCESS_OK))) != 0) {
-            if (rc == ERR_FMT_MISMATCH) {
-                tpl_hook.oops("%s: format signature mismatch\n", filename);
-            } else if (rc == ERR_FLEN_MISMATCH) { 
-                tpl_hook.oops("%s: array lengths mismatch\n", filename);
-            } else { 
-                tpl_hook.oops("%s: not a valid tpl file\n", filename); 
-            }
-            tpl_unmap_file( &((tpl_root_data*)(r->data))->mmap );
-            return -1;
-        }
-        ((tpl_root_data*)(r->data))->flags = (TPL_FILE | TPL_RDONLY);
-    } else if (mode & TPL_MEM) {
+    if (mode & TPL_MEM) {
         ((tpl_root_data*)(r->data))->mmap.text = addr;
         ((tpl_root_data*)(r->data))->mmap.text_sz = sz;
         if ( (rc = tpl_sanity(r, (mode & TPL_EXCESS_OK))) != 0) {
@@ -1726,63 +1590,6 @@ static int tpl_serlen(tpl_node *r, tpl_node *n, void *dv, size_t *serlen) {
     return 0;
 }
 
-static int tpl_mmap_output_file(char *filename, size_t sz, void **text_out) {
-    void *text;
-    int fd,perms;
-
-#ifndef _WIN32
-    perms = S_IRUSR|S_IWUSR|S_IWGRP|S_IRGRP|S_IROTH;  /* ug+w o+r */
-    fd=open(filename,O_CREAT|O_TRUNC|O_RDWR,perms);
-#else
-	perms = _S_IWRITE;
-    fd=_open(filename,_O_CREAT|_O_TRUNC|_O_RDWR,perms);
-#endif
-
-    if ( fd == -1 ) {
-        tpl_hook.oops("Couldn't open file %s: %s\n", filename, strerror(errno));
-        return -1;
-    }
-
-    text = mmap(0, sz, PROT_READ|PROT_WRITE, MAP_SHARED, fd, 0);
-    if (text == MAP_FAILED) {
-        tpl_hook.oops("Failed to mmap %s: %s\n", filename, strerror(errno));
-        close(fd);
-        return -1;
-    }
-    if (ftruncate(fd,sz) == -1) {
-        tpl_hook.oops("ftruncate failed: %s\n", strerror(errno));
-        munmap( text, sz );
-        close(fd);
-        return -1;
-    }
-    *text_out = text;
-    return fd;
-}
-
-static int tpl_mmap_file(char *filename, tpl_mmap_rec *mr) {
-    struct stat stat_buf;
-
-    if ( (mr->fd = open(filename, O_RDONLY)) == -1 ) {
-        tpl_hook.oops("Couldn't open file %s: %s\n", filename, strerror(errno));
-        return -1;
-    }
-
-    if ( fstat(mr->fd, &stat_buf) == -1) {
-        close(mr->fd);
-        tpl_hook.oops("Couldn't stat file %s: %s\n", filename, strerror(errno));
-        return -1;
-    }
-
-    mr->text_sz = (size_t)stat_buf.st_size;  
-    mr->text = mmap(0, stat_buf.st_size, PROT_READ, MAP_PRIVATE, mr->fd, 0);
-    if (mr->text == MAP_FAILED) {
-        close(mr->fd);
-        tpl_hook.oops("Failed to mmap %s: %s\n", filename, strerror(errno));
-        return -1;
-    }
-
-    return 0;
-}
 
 TPL_API int tpl_pack(tpl_node *r, int i) {
     tpl_node *n, *child, *np;
@@ -1800,10 +1607,10 @@ TPL_API int tpl_pack(tpl_node *r, int i) {
         return -1;
     }
 
-    if (((tpl_root_data*)(r->data))->flags & TPL_RDONLY) {
-        /* convert to an writeable tpl, initially empty */
-        tpl_free_keep_map(r);
-    }
+    // if (((tpl_root_data*)(r->data))->flags & TPL_RDONLY) {
+    //     /* convert to an writeable tpl, initially empty */
+    //     tpl_free_keep_map(r);
+    // }
 
     ((tpl_root_data*)(r->data))->flags |= TPL_WRONLY;
 
@@ -1828,12 +1635,12 @@ TPL_API int tpl_pack(tpl_node *r, int i) {
                 /* copy the buffer to be packed */ 
                 slen = ((tpl_bin*)child->addr)->sz;
                 if (slen >0) {
-                    str = tpl_hook.malloc(slen);
+                    str = (char*) tpl_hook.malloc(slen);
                     if (!str) fatal_oom();
                     memcpy(str,((tpl_bin*)child->addr)->addr,slen);
                 } else str = NULL;
                 /* and make a tpl_bin to point to it */
-                bin = tpl_hook.malloc(sizeof(tpl_bin));
+                bin = (tpl_bin*) tpl_hook.malloc(sizeof(tpl_bin));
                 if (!bin) fatal_oom();
                 bin->addr = str;
                 bin->sz = slen;
@@ -1862,7 +1669,7 @@ TPL_API int tpl_pack(tpl_node *r, int i) {
                   char **cdata = &((char**)child->data)[fidx];
                   slen = caddr ?  (strlen(caddr) + 1) : 0;
                   if (slen) {
-                    str = tpl_hook.malloc(slen);
+                    str = (char*) tpl_hook.malloc(slen);
                     if (!str) fatal_oom();
                     memcpy(str,caddr,slen); /* include \0 */
                   } else {
@@ -1938,9 +1745,6 @@ TPL_API int tpl_pack(tpl_node *r, int i) {
                    }
 
                  }
-                break;
-            default:
-                tpl_hook.fatal("unsupported format character\n");
                 break;
         }
         child=child->next;
@@ -2177,7 +1981,7 @@ static void tpl_fatal(const char *fmt, ...) {
     char exit_msg[100];
 
     va_start(ap,fmt);
-    vsnprintf(exit_msg, 100, fmt, ap);
+    //FIXME: vsnprintf(exit_msg, 100, fmt, ap);
     va_end(ap);
 
     tpl_hook.oops("%s", exit_msg);
@@ -2196,7 +2000,7 @@ TPL_API int tpl_gather(int mode, ...) {
     switch (mode) {
         case TPL_GATHER_BLOCKING:
             fd = va_arg(ap,int);
-            img = va_arg(ap,void*);
+            img = va_arg(ap, void**);
             szp = va_arg(ap,size_t*);
             rc = tpl_gather_blocking(fd,img,szp);
             break;
@@ -2213,7 +2017,7 @@ TPL_API int tpl_gather(int mode, ...) {
             gs = (tpl_gather_t**)va_arg(ap,void*);
             cb = (tpl_gather_cb*)va_arg(ap,tpl_gather_cb*);
             data = va_arg(ap,void*);
-            rc = tpl_gather_mem(addr,sz,gs,cb,data);
+            rc = tpl_gather_mem((char*) addr, sz, gs, cb, (char*) data);
             break;
         default:
             tpl_hook.fatal("unsupported tpl_gather mode %d\n",mode);
@@ -2276,7 +2080,7 @@ static int tpl_gather_blocking(int fd, void **img, size_t *sz) {
     do { 
         rc = read(fd,&((*(char**)img)[i]),tpllen-i);
         i += (rc>0) ? rc : 0;
-    } while ((rc==-1 && (errno==EINTR||errno==EAGAIN)) || (rc>0 && i<tpllen));
+    } while ((rc==-1 && (errno==EINTR||errno==EAGAIN)) || (rc>0 && (uint64_t) i < tpllen));
 
     if (rc<0) {
         tpl_hook.oops("tpl_gather_fd_blocking failed: %s\n", strerror(errno));
@@ -2286,7 +2090,7 @@ static int tpl_gather_blocking(int fd, void **img, size_t *sz) {
         /* tpl_hook.oops("tpl_gather_fd_blocking: eof\n"); */
         tpl_hook.free(*img);
         return 0;
-    } else if (i != tpllen) {
+    } else if ((uint64_t) i != tpllen) {
         tpl_hook.oops("internal error\n");
         tpl_hook.free(*img);
         return -1;
@@ -2338,7 +2142,7 @@ static int tpl_gather_nonblocking( int fd, tpl_gather_t **gs, tpl_gather_cb *cb,
                         tpl_hook.gather_max);
                     return -2;              /* error, caller should close fd */
                 }
-                if ( (img = tpl_hook.realloc((*gs)->img, catlen)) == NULL) {
+                if ( (img = (char*) tpl_hook.realloc((*gs)->img, catlen)) == NULL) {
                     fatal_oom();
                 }
                 memcpy(img + (*gs)->len, buf, rc);
@@ -2379,17 +2183,17 @@ static int tpl_gather_nonblocking( int fd, tpl_gather_t **gs, tpl_gather_cb *cb,
             /* store any leftover, partial tpl fragment for next read */
             if (tpl == img && img != buf) {  
                 /* consumed nothing from img!=buf */
-                if ( (*gs = tpl_hook.malloc(sizeof(tpl_gather_t))) == NULL ) {
+                if ( (*gs = (tpl_gather_t*) tpl_hook.malloc(sizeof(tpl_gather_t))) == NULL ) {
                     fatal_oom();
                 }
                 (*gs)->img = tpl;
                 (*gs)->len = catlen;
             } else if (tpl < img+catlen) {  
                 /* consumed 1+ tpl(s) from img!=buf or 0 from img==buf */
-                if ( (*gs = tpl_hook.malloc(sizeof(tpl_gather_t))) == NULL ) {
+                if ( (*gs = (tpl_gather_t*) tpl_hook.malloc(sizeof(tpl_gather_t))) == NULL ) {
                     fatal_oom();
                 }
-                if ( ((*gs)->img = tpl_hook.malloc(img+catlen - tpl)) == NULL ) {
+                if ( ((*gs)->img = (char*) tpl_hook.malloc(img+catlen - tpl)) == NULL ) {
                     fatal_oom();
                 }
                 (*gs)->len = img+catlen - tpl;
@@ -2423,7 +2227,7 @@ static int tpl_gather_mem( char *buf, size_t len, tpl_gather_t **gs, tpl_gather_
                 tpl_hook.gather_max);
             return -2;              /* error, caller should stop accepting input from source*/
         }
-        if ( (img = tpl_hook.realloc((*gs)->img, catlen)) == NULL) {
+        if ( (img = (char*) tpl_hook.realloc((char*) (*gs)->img, catlen)) == NULL) {
             fatal_oom();
         }
         memcpy(img + (*gs)->len, buf, len);
@@ -2464,17 +2268,17 @@ static int tpl_gather_mem( char *buf, size_t len, tpl_gather_t **gs, tpl_gather_
     /* store any leftover, partial tpl fragment for next read */
     if (tpl == img && img != buf) {  
         /* consumed nothing from img!=buf */
-        if ( (*gs = tpl_hook.malloc(sizeof(tpl_gather_t))) == NULL ) {
+        if ( (*gs = (tpl_gather_t*) tpl_hook.malloc(sizeof(tpl_gather_t))) == NULL ) {
             fatal_oom();
         }
         (*gs)->img = tpl;
         (*gs)->len = catlen;
     } else if (tpl < img+catlen) {  
         /* consumed 1+ tpl(s) from img!=buf or 0 from img==buf */
-        if ( (*gs = tpl_hook.malloc(sizeof(tpl_gather_t))) == NULL ) {
+        if ( (*gs = (tpl_gather_t*) tpl_hook.malloc(sizeof(tpl_gather_t))) == NULL ) {
             fatal_oom();
         }
-        if ( ((*gs)->img = tpl_hook.malloc(img+catlen - tpl)) == NULL ) {
+        if ( ((*gs)->img = (char*) tpl_hook.malloc(img+catlen - tpl)) == NULL ) {
             fatal_oom();
         }
         (*gs)->len = img+catlen - tpl;

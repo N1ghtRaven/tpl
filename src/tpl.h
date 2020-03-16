@@ -27,36 +27,14 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include <stddef.h>     /* size_t */
 
 #include <stdarg.h>  /* va_list */
-
-#ifdef __INTEL_COMPILER
-#include <tbb/tbbmalloc_proxy.h>
-#endif /* Intel Compiler efficient memcpy etc */
-
-#ifdef _MSC_VER
-typedef unsigned int uint32_t;
-#else
 #include <inttypes.h>   /* uint32_t */
-#endif
 
 #if defined __cplusplus
 extern "C" {
 #endif
 
-#ifdef _WIN32
-#ifdef TPL_EXPORTS
-#define TPL_API __declspec(dllexport)
-#else							/*  */
-#ifdef TPL_NOLIB
-#define TPL_API
-#else
-#define TPL_API __declspec(dllimport)
-#endif /* TPL_NOLIB */
-#endif	/* TPL_EXPORTS*/
-#else
-#define TPL_API
-#endif
-
 /* bit flags (external) */
+#define TPL_API
 #define TPL_FILE      (1 << 0)
 #define TPL_MEM       (1 << 1)
 #define TPL_PREALLOCD (1 << 2)
